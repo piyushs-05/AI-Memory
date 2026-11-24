@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-memory.local/schemas/session.schema.json",
+  "title": "Session Record Frontmatter",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "id",
+    "type",
+    "context_id",
+    "source_application",
+    "scope_id",
+    "started_at",
+    "capture_coverage",
+    "revision"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0" },
+    "id": { "type": "string", "pattern": "^ses_[a-zA-Z0-9_-]{6,64}$" },
+    "type": { "type": "string", "const": "session" },
+    "context_id": { "type": "string", "pattern": "^ctx_[a-zA-Z0-9_-]{6,64}$" },
+    "source_application": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "scope_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "project_id": { "type": ["string", "null"], "pattern": "^prj_[a-zA-Z0-9_-]{6,64}$" },
+    "title": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "revision": { "type": "integer", "minimum": 1 },
+    "started_at": { "type": "string", "minLength": 20, "maxLength": 64 },
+    "ended_at": { "type": ["string", "null"], "maxLength": 64 },
+    "capture_coverage": { "type": "string", "enum": ["full_accessible_transcript", "partial_events", "summary_only"] },
+    "known_gaps": {
+      "type": "array",
+      "maxItems": 32,
+      "items": { "type": "string", "maxLength": 512 }
+    },
+    "processing_checkpoint": { "type": "integer", "minimum": 0 },
+    "handoff_summary_id": { "type": ["string", "null"], "pattern": "^mem_[a-zA-Z0-9_-]{6,64}$" }
+  }
+}

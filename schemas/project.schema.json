@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-memory.local/schemas/project.schema.json",
+  "title": "Project Record Frontmatter",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "id",
+    "type",
+    "scope_id",
+    "title",
+    "revision",
+    "status",
+    "recorded_at",
+    "updated_at"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0" },
+    "id": { "type": "string", "pattern": "^prj_[a-zA-Z0-9_-]{6,64}$" },
+    "type": { "type": "string", "const": "project" },
+    "scope_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "parent_scope_id": { "type": ["string", "null"], "maxLength": 128 },
+    "title": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "revision": { "type": "integer", "minimum": 1 },
+    "status": { "type": "string", "enum": ["active", "paused", "completed", "archived"] },
+    "recorded_at": { "type": "string", "minLength": 20, "maxLength": 64 },
+    "updated_at": { "type": "string", "minLength": 20, "maxLength": 64 },
+    "sources": {
+      "type": "array",
+      "maxItems": 128,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["record_id"],
+        "properties": {
+          "record_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "quote": { "type": ["string", "null"], "maxLength": 2000 }
+        }
+      }
+    },
+    "relations": {
+      "type": "array",
+      "maxItems": 128,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["type", "target_id"],
+        "properties": {
+          "type": { "type": "string", "enum": ["supports", "contradicts", "supersedes", "summarizes", "part_of", "related_to"] },
+          "target_id": { "type": "string", "minLength": 1, "maxLength": 128 }
+        }
+      }
+    }
+  }
+}

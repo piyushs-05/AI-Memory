@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+dist/
+build/
+
+# Local scratch, machine-specific host docs & secrets
+work/
+*-Host-Setup.md
+AGENTS.md
+scripts/*.local.ps1
+*.env
+.env*
+*token*
+*secret*
+*.key
+*.pem
+
+# Runtime data (never commit vault/runtime/secrets)
+memory-home/
+*.db
+*.db-wal
+*.db-shm

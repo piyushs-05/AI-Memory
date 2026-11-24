@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-memory.local/schemas/document.schema.json",
+  "title": "Document Companion Record Frontmatter",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "id",
+    "type",
+    "scope_id",
+    "title",
+    "revision",
+    "original_attachment_path",
+    "original_filename",
+    "media_type",
+    "checksum_sha256",
+    "size_bytes",
+    "acquired_at",
+    "extraction_status"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0" },
+    "id": { "type": "string", "pattern": "^doc_[a-zA-Z0-9_-]{6,64}$" },
+    "type": { "type": "string", "const": "document" },
+    "scope_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "project_id": { "type": ["string", "null"], "pattern": "^prj_[a-zA-Z0-9_-]{6,64}$" },
+    "title": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "revision": { "type": "integer", "minimum": 1 },
+    "original_attachment_path": { "type": "string", "minLength": 1, "maxLength": 512 },
+    "original_filename": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "media_type": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "checksum_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "size_bytes": { "type": "integer", "minimum": 0 },
+    "acquisition_source": { "type": ["string", "null"], "maxLength": 256 },
+    "acquired_at": { "type": "string", "minLength": 20, "maxLength": 64 },
+    "extraction_status": { "type": "string", "enum": ["pending", "extracted", "ocr_extracted", "failed", "skipped"] },
+    "page_count": { "type": ["integer", "null"], "minimum": 1 },
+    "derived_note_ids": {
+      "type": "array",
+      "maxItems": 128,
+      "items": { "type": "string", "minLength": 1, "maxLength": 128 }
+    },
+    "archived": { "type": "boolean" },
+    "archived_at": { "type": ["string", "null"], "maxLength": 64 },
+    "archived_reason": { "type": ["string", "null"], "maxLength": 512 }
+  }
+}

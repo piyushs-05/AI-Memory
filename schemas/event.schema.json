@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-memory.local/schemas/event.schema.json",
+  "title": "Original Event Record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "id",
+    "session_id",
+    "scope_id",
+    "source_application",
+    "sequence",
+    "speaker",
+    "event_type",
+    "recorded_at",
+    "content"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0" },
+    "id": { "type": "string", "pattern": "^evt_[a-zA-Z0-9_-]{6,64}$" },
+    "session_id": { "type": "string", "pattern": "^ses_[a-zA-Z0-9_-]{6,64}$" },
+    "scope_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "source_application": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "source_event_id": { "type": ["string", "null"], "maxLength": 256 },
+    "sequence": { "type": "integer", "minimum": 0 },
+    "speaker": { "type": "string", "enum": ["user", "assistant", "system", "tool", "external"] },
+    "event_type": { "type": "string", "enum": ["message", "note", "correction", "tool_result", "import", "decision_note"] },
+    "recorded_at": { "type": "string", "minLength": 20, "maxLength": 64 },
+    "occurred_at": { "type": ["string", "null"], "maxLength": 64 },
+    "content": { "type": "string", "maxLength": 200000 },
+    "attachment_ids": {
+      "type": "array",
+      "maxItems": 64,
+      "items": { "type": "string", "pattern": "^doc_[a-zA-Z0-9_-]{6,64}$" }
+    },
+    "source_reference": { "type": ["string", "null"], "maxLength": 512 }
+  }
+}

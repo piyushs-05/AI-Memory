@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-memory.local/schemas/task.schema.json",
+  "title": "Task Record Frontmatter",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "id",
+    "type",
+    "scope_id",
+    "title",
+    "revision",
+    "status",
+    "priority",
+    "origin",
+    "recorded_at",
+    "updated_at",
+    "sources"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0" },
+    "id": { "type": "string", "pattern": "^task_[a-zA-Z0-9_-]{6,64}$" },
+    "type": { "type": "string", "const": "task" },
+    "scope_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "project_id": { "type": ["string", "null"], "pattern": "^prj_[a-zA-Z0-9_-]{6,64}$" },
+    "title": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "revision": { "type": "integer", "minimum": 1 },
+    "status": { "type": "string", "enum": ["inbox", "next", "in_progress", "blocked", "done", "cancelled"] },
+    "priority": { "type": "string", "enum": ["low", "normal", "high", "urgent"] },
+    "origin": { "type": "string", "enum": ["explicit_user_statement", "observation", "inference", "import", "assistant_proposal"] },
+    "proposal": { "type": "boolean" },
+    "scheduled_date": { "type": ["string", "null"], "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
+    "due_date": { "type": ["string", "null"], "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
+    "blocked_reason": { "type": ["string", "null"], "maxLength": 512 },
+    "depends_on": {
+      "type": "array",
+      "maxItems": 64,
+      "items": { "type": "string", "pattern": "^task_[a-zA-Z0-9_-]{6,64}$" }
+    },
+    "completed_at": { "type": ["string", "null"], "maxLength": 64 },
+    "completion_history": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["action", "at"],
+        "properties": {
+          "action": { "type": "string", "enum": ["completed", "cancelled", "reopened"] },
+          "at": { "type": "string", "maxLength": 64 },
+          "reason": { "type": ["string", "null"], "maxLength": 512 }
+        }
+      }
+    },
+    "recorded_at": { "type": "string", "minLength": 20, "maxLength": 64 },
+    "updated_at": { "type": "string", "minLength": 20, "maxLength": 64 },
+    "sources": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 128,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["record_id"],
+        "properties": {
+          "record_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "quote": { "type": ["string", "null"], "maxLength": 2000 }
+        }
+      }
+    },
+    "relations": {
+      "type": "array",
+      "maxItems": 128,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["type", "target_id"],
+        "properties": {
+          "type": { "type": "string", "enum": ["supports", "contradicts", "supersedes", "summarizes", "part_of", "related_to"] },
+          "target_id": { "type": "string", "minLength": 1, "maxLength": 128 }
+        }
+      }
+    },
+    "archived": { "type": "boolean" },
+    "archived_at": { "type": ["string", "null"], "maxLength": 64 },
+    "archived_reason": { "type": ["string", "null"], "maxLength": 512 }
+  }
+}

@@ -411,10 +411,10 @@ class MemoryIndex:
         added = 0
         removed = 0
 
-        existing_map: dict[str, tuple[str, str]] = {}
+        existing_map: dict[str, tuple[str, str, int]] = {}
         with self._lock:
-            for row in self._conn.execute("SELECT id, file_path, content_hash FROM records").fetchall():
-                existing_map[row["id"]] = (row["file_path"], row["content_hash"])
+            for row in self._conn.execute("SELECT id, file_path, content_hash, revision FROM records").fetchall():
+                existing_map[row["id"]] = (row["file_path"], row["content_hash"], int(row["revision"]))
 
         for md_path in sorted(vault_dir.rglob("*.md")):
             rel = md_path.relative_to(vault_dir)
@@ -446,6 +446,10 @@ class MemoryIndex:
                 )
                 added += 1
             elif prev[0] != str(md_path) or prev[1] != rhash:
+                # If file content changed on disk (manual Obsidian edit), bump revision so stale callers conflict
+                if prev[1] != rhash and int(meta.get("revision", 1)) <= prev[2]:
+                    meta = dict(meta)
+                    meta["revision"] = prev[2] + 1
                 self.upsert_record(
                     record_id=record_id, kind=kind, meta=meta, body=body, file_path=md_path, raw_hash=rhash
                 )
@@ -481,6 +485,10 @@ class MemoryIndex:
             return rec
         if meta.get("id") != record_id:
             return rec
+        # Bump revision when manual disk edit is reconciled so stale callers get revision_conflict
+        if int(meta.get("revision", 1)) <= int(rec["revision"]):
+            meta = dict(meta)
+            meta["revision"] = int(rec["revision"]) + 1
         self.upsert_record(
             record_id=record_id,
             kind=rec["kind"],

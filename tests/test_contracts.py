@@ -332,11 +332,27 @@ def test_r12_startup_reconciliation_and_live_manual_edit_visibility(setup):
     finally:
         restarted.close()
 
-    # Manual edit on an existing note is immediately visible via read_page
+    # Manual edit on an existing note is immediately visible via read_page AND bumps revision
+    # so a stale automated update holding the old revision gets revision_conflict
     rec_path = Path(core.index.get_record(record_id)["file_path"])
     rec_path.write_text(rec_path.read_text(encoding="utf-8") + "\nManual correction marker.\n", encoding="utf-8")
     response = call(core, owner, ctx, "read_page", {"record_id": record_id})
     assert "Manual correction marker." in response["data"]["body"]
+    assert response["data"]["revision"] == 2
+    stale = call(
+        core,
+        owner,
+        ctx,
+        "update_memory",
+        {
+            "record_id": record_id,
+            "expected_revision": 1,
+            "changes": {"body": "Stale overwrite attempt."},
+            "reason": "Stale agent update after manual edit",
+        },
+    )
+    assert not stale["ok"] and stale["error"]["code"] == "revision_conflict"
+    assert "Manual correction marker." in rec_path.read_text(encoding="utf-8")
 
 
 def test_r13_forgetting_source_clears_derived_active_content(setup):

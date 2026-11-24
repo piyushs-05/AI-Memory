@@ -18,7 +18,7 @@ SERVER_INSTRUCTIONS = (
     "start a session with `start_session` and call `append_events` with the FULL accessible user message verbatim "
     "(never drop a clause; use field `speaker: 'user'`, NOT `role`).\n"
     "3. Persist EVERY distinct item citing the captured `evt_*` ID in `sources: [{\"record_id\": \"evt_...\", \"quote\": \"...\"}]`:\n"
-    "   - Temporary activity/experiment (e.g. 'trying Go this weekend') -> `create_memory` with `type: 'state'`, `origin: 'explicit_user_statement'` (never a lasting `preference`).\n"
+    "   - Temporary activity/experiment (e.g. 'trying Go this weekend') -> `create_memory` with `type: 'state'`, `origin: 'explicit_user_statement'`, and `valid_from`/`valid_until` (YYYY-MM-DD) when a window is stated (never a lasting `preference`).\n"
     "   - Actionable task/reminder -> `create_task` with `origin: 'explicit_user_statement'` (or `origin: 'assistant_proposal'`, `proposal: true`, `status: 'inbox'` for assistant suggestions).\n"
     "   - Assistant suggestions are NEVER `origin: 'explicit_user_statement'` or accepted `current` decisions.\n"
     "4. Always pass a unique `idempotency_key` on every mutating call.\n"
@@ -117,6 +117,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "capture_coverage": {
                     "type": "string",
                     "enum": ["full_accessible_transcript", "partial_events", "summary_only"],
+                    "description": "Use 'partial_events' unless BOTH user and assistant turns are appended via append_events.",
                 },
                 "scope_id": {"type": "string", "description": "Owning scope (e.g. 'personal', 'work', 'shared')."},
                 "project_id": {"type": "string"},

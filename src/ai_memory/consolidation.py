@@ -3,9 +3,38 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from typing import Any, Protocol
+from zoneinfo import ZoneInfo
 
 from .ids import utc_now_iso
+
+
+def _resolve_temp_window(text_lower: str, recorded_at: str | None, tz_name: str) -> tuple[str | None, str | None]:
+    """Resolve explicit temporary windows ('today', 'this weekend', 'this week') into YYYY-MM-DD bounds."""
+    if not recorded_at:
+        return None, None
+    try:
+        dt = datetime.fromisoformat(recorded_at.replace("Z", "+00:00")).astimezone(ZoneInfo(tz_name))
+    except Exception:
+        return None, None
+
+    d = dt.date()
+    wd = d.weekday()  # Monday=0 .. Sunday=6
+    if "weekend" in text_lower:
+        if wd <= 5:
+            sat = d + timedelta(days=(5 - wd))
+            sun = sat + timedelta(days=1)
+        else:
+            sat = d
+            sun = d
+        return sat.isoformat(), sun.isoformat()
+    if "this week" in text_lower:
+        sun = d + timedelta(days=(6 - wd))
+        return d.isoformat(), sun.isoformat()
+    if "today" in text_lower:
+        return d.isoformat(), d.isoformat()
+    return d.isoformat(), None
 
 
 @dataclass(frozen=True)
@@ -45,6 +74,15 @@ class StubConsolidationProvider:
         schema_version: str,
         policy_constraints: dict[str, Any],
     ) -> ConsolidationResult:
+        tz_name = str(policy_constraints.get("timezone") or "Asia/Kolkata")
+        # Collect event IDs already covered by existing active memories to avoid duplicate states
+        already_cited_event_ids: set[str] = set()
+        for mem in relevant_memories:
+            meta = mem.get("metadata") or {}
+            for src in meta.get("sources") or []:
+                if isinstance(src, dict) and src.get("record_id"):
+                    already_cited_event_ids.add(str(src["record_id"]))
+
         proposals: list[dict[str, Any]] = []
         for evt in events:
             speaker = evt.get("speaker")
@@ -52,8 +90,12 @@ class StubConsolidationProvider:
             if not text:
                 continue
             lower = text.lower()
-            # Respect epistemic discipline: temporary evaluation -> state, never lasting preference
-            if speaker == "user" and ("trying" in lower or "evaluating" in lower or "this week" in lower):
+            # Respect epistemic discipline: temporary evaluation -> state with resolved expiry,
+            # skipped if an active memory already cites this event.
+            if speaker == "user" and ("trying" in lower or "evaluating" in lower or "this week" in lower or "weekend" in lower):
+                if evt["id"] in already_cited_event_ids:
+                    continue
+                valid_from, valid_until = _resolve_temp_window(lower, evt.get("recorded_at"), tz_name)
                 proposals.append(
                     {
                         "kind": "memory",
@@ -62,6 +104,8 @@ class StubConsolidationProvider:
                         "body": f"Temporary activity noted from source event: {text}",
                         "origin": "explicit_user_statement",
                         "status": "current",
+                        "valid_from": valid_from,
+                        "valid_until": valid_until,
                         "sources": [{"record_id": evt["id"], "quote": text[:300]}],
                     }
                 )

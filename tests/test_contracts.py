@@ -836,3 +836,99 @@ def test_ph2_mcp_tool_schemas_and_inline_bootstrap_rules(setup):
     assert "explicit_user_statement" in bootstrap["inline_rules"]["task_origins"]
 
 
+def test_consolidation_deduplicates_temp_state_preserves_expiry_and_creates_handoff(setup):
+    """
+    Verify all three post-Phase-2 gaps:
+    1. Consolidation skips duplicating a temporary state memory already created for an event,
+       and preserves valid_from/valid_until expiry when creating a new temporary state.
+    2. Closed sessions receive a sourced handoff summary memory linked via handoff_summary_id.
+    3. full_accessible_transcript is downgraded to partial_events when assistant turns are missing.
+    """
+    core, owner, work, ctx = setup
+
+    # Session A: claims full_accessible_transcript, captures only a user message, agent already creates state memory
+    ses_a = call(
+        core,
+        owner,
+        ctx,
+        "start_session",
+        {"source_application": "codex", "capture_coverage": "full_accessible_transcript", "scope_id": "personal"},
+    )["data"]["session_id"]
+    evt_a = call(
+        core,
+        owner,
+        ctx,
+        "append_events",
+        {"session_id": ses_a, "events": [{"speaker": "user", "content": "I am trying Go for a weekend CLI experiment."}]},
+    )["data"]["accepted_ids"][0]
+    call(
+        core,
+        owner,
+        ctx,
+        "create_memory",
+        {
+            "type": "state",
+            "scope_id": "personal",
+            "title": "Trying Go this weekend",
+            "body": "Temporary weekend Go CLI experiment.",
+            "origin": "explicit_user_statement",
+            "valid_from": "2026-11-28",
+            "valid_until": "2026-11-29",
+            "sources": [{"record_id": evt_a}],
+        },
+    )
+    end_a = call(core, owner, ctx, "end_session", {"session_id": ses_a})
+    assert end_a["ok"]
+    # Coverage MUST be downgraded because no assistant turn was captured
+    assert end_a["data"]["capture_coverage"] == "partial_events"
+    assert any("no assistant turns" in g for g in end_a["data"]["known_gaps"])
+
+    worker = BackgroundWorker(core)
+    outcomes_a = worker.run_once()
+    assert len(outcomes_a) == 1 and outcomes_a[0]["status"] == "completed"
+    # Must NOT have created a duplicate state memory for evt_a
+    state_mems_a = [m for m in core.index.list_records(kind="memory") if m["record_type"] == "state"]
+    assert len(state_mems_a) == 1
+    # Session A MUST now have a linked handoff summary memory + updated checkpoint
+    ses_a_rec = core.index.get_record(ses_a)
+    handoff_id = ses_a_rec["metadata"]["handoff_summary_id"]
+    assert handoff_id and handoff_id.startswith("mem_")
+    assert ses_a_rec["metadata"]["processing_checkpoint"] == 1
+    handoff_rec = core.index.get_record(handoff_id)
+    assert handoff_rec["record_type"] == "summary"
+
+    # Session B: both user + assistant turns captured -> full_accessible_transcript preserved;
+    # consolidation creates a NEW temporary state memory WITH valid_from & valid_until expiry!
+    ses_b = call(
+        core,
+        owner,
+        ctx,
+        "start_session",
+        {"source_application": "codex", "capture_coverage": "full_accessible_transcript", "scope_id": "personal"},
+    )["data"]["session_id"]
+    call(
+        core,
+        owner,
+        ctx,
+        "append_events",
+        {
+            "session_id": ses_b,
+            "events": [
+                {"speaker": "user", "content": "I am evaluating Zig this weekend."},
+                {"speaker": "assistant", "content": "Noted your temporary Zig evaluation."},
+            ],
+        },
+    )
+    end_b = call(core, owner, ctx, "end_session", {"session_id": ses_b})
+    assert end_b["ok"] and end_b["data"]["capture_coverage"] == "full_accessible_transcript"
+
+    outcomes_b = worker.run_once()
+    assert len(outcomes_b) == 1 and outcomes_b[0]["status"] == "completed"
+    assert len(outcomes_b[0]["created_ids"]) == 1
+    zig_mem = core.index.get_record(outcomes_b[0]["created_ids"][0])
+    assert zig_mem["record_type"] == "state"
+    assert zig_mem["metadata"]["valid_from"] is not None
+    assert zig_mem["metadata"]["valid_until"] is not None
+
+
+

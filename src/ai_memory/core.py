@@ -603,6 +603,26 @@ class MemoryCore:
 
         meta = dict(ses_rec["metadata"])
         meta["ended_at"] = utc_now_iso()
+
+        # Verify capture_coverage truthfulness against actually captured events
+        ses_events = self.index.list_session_events(session_id)
+        speakers = {e.get("speaker") for e in ses_events}
+        gaps = list(meta.get("known_gaps") or [])
+        if meta.get("capture_coverage") == "full_accessible_transcript":
+            if not ses_events:
+                meta["capture_coverage"] = "partial_events"
+                gap_msg = "Downgraded from full_accessible_transcript: no events were captured in this session"
+                if gap_msg not in gaps:
+                    gaps.append(gap_msg)
+                warnings.append(gap_msg)
+            elif "user" not in speakers or "assistant" not in speakers:
+                missing = "assistant" if "assistant" not in speakers else "user"
+                meta["capture_coverage"] = "partial_events"
+                gap_msg = f"Downgraded from full_accessible_transcript: no {missing} turns were captured in this session"
+                if gap_msg not in gaps:
+                    gaps.append(gap_msg)
+                warnings.append(gap_msg)
+        meta["known_gaps"] = gaps
         meta["revision"] = int(meta["revision"]) + 1
         self.schemas.validate("session", meta)
 
@@ -641,6 +661,8 @@ class MemoryCore:
         return {
             "session_id": session_id,
             "ended_at": meta["ended_at"],
+            "capture_coverage": meta["capture_coverage"],
+            "known_gaps": meta["known_gaps"],
             "final_capture": final_capture,
             "consolidation_job_id": job["job_id"],
             "mutation_id": entry["mutation_id"],
@@ -1739,12 +1761,12 @@ class MemoryCore:
                 for r in evt_rows
                 if Path(r["file_path"]).is_file()
             ]
-            relevant = self.index.list_records(kind="memory", scopes=[scope_id], include_archived=False)[:20]
+            relevant = self.index.list_records(kind="memory", scopes=[scope_id], include_archived=False)[:50]
             result = self.provider.consolidate(
                 events=events,
                 relevant_memories=relevant,
                 schema_version="1.0",
-                policy_constraints={"scope_id": scope_id},
+                policy_constraints={"scope_id": scope_id, "timezone": self.config.timezone},
             )
             created: list[str] = []
             rejected: list[dict[str, Any]] = []
@@ -1766,6 +1788,9 @@ class MemoryCore:
                             "body": prop.get("body"),
                             "origin": prop.get("origin"),
                             "status": prop.get("status", "current"),
+                            "occurred_at": prop.get("occurred_at"),
+                            "valid_from": prop.get("valid_from"),
+                            "valid_until": prop.get("valid_until"),
                             "sources": prop.get("sources"),
                             "processing": result.provider_metadata,
                         },
@@ -1800,13 +1825,123 @@ class MemoryCore:
                 self.index.update_job_status(job_id, "failed", last_error=err_msg)
                 return {"job_id": job_id, "status": "failed", "created_ids": created, "rejected": rejected}
 
+            # Generate a sourced handoff summary memory and link it on the closed session
+            handoff_id = self._ensure_session_handoff_summary(
+                session_id=ses_id,
+                scope_id=scope_id,
+                events=events,
+                created_ids=created,
+                provider_metadata=result.provider_metadata,
+                job_id=job_id,
+                client=client,
+                ctx=ctx,
+            )
+
             self.index.update_job_status(job_id, "completed")
             self.index.set_meta("last_consolidation_at", utc_now_iso())
-            return {"job_id": job_id, "status": "completed", "created_ids": created, "rejected": []}
+            return {
+                "job_id": job_id,
+                "status": "completed",
+                "created_ids": created,
+                "handoff_summary_id": handoff_id,
+                "rejected": [],
+            }
         except Exception as exc:
             next_state = "failed" if job["attempts"] + 1 >= job["max_attempts"] else "retry_wait"
             self.index.update_job_status(job_id, next_state, last_error=str(exc))
             return {"job_id": job_id, "status": next_state, "error": str(exc)}
+
+    def _ensure_session_handoff_summary(
+        self,
+        *,
+        session_id: str,
+        scope_id: str,
+        events: list[dict[str, Any]],
+        created_ids: list[str],
+        provider_metadata: dict[str, Any],
+        job_id: str,
+        client: ClientIdentity,
+        ctx: dict[str, Any],
+    ) -> str | None:
+        """Create a sourced handoff summary memory and link it on the closed session record."""
+        ses_rec = self.index.get_record(session_id)
+        if ses_rec is None or not events:
+            return None
+        existing_handoff = ses_rec["metadata"].get("handoff_summary_id")
+        if existing_handoff:
+            return str(existing_handoff)
+
+        sources = [{"record_id": e["id"]} for e in events[:32]]
+        bullet_lines = [
+            f"- [{e.get('speaker', 'unknown')}] {(e.get('content') or '').strip()[:240]}"
+            for e in events[:20]
+        ]
+        if created_ids:
+            bullet_lines.append(f"- Consolidated records: {', '.join(created_ids)}")
+        coverage = ses_rec["metadata"].get("capture_coverage", "partial_events")
+        body = (
+            f"# Session Handoff — {ses_rec['title']}\n\n"
+            f"Coverage: `{coverage}` ({len(events)} captured event(s)).\n\n"
+            "## Captured Highlights\n" + "\n".join(bullet_lines)
+        )
+        sum_resp = self.dispatch(
+            client=client,
+            operation="create_memory",
+            context_id=ctx["context_id"],
+            idempotency_key=f"handoff:{job_id}:{session_id}",
+            payload={
+                "type": "summary",
+                "scope_id": scope_id,
+                "title": f"Handoff Summary: {ses_rec['title']}",
+                "body": body,
+                "origin": "observation",
+                "status": "current",
+                "sources": sources,
+                "relations": [{"type": "summarizes", "target_id": session_id}],
+                "processing": provider_metadata or None,
+            },
+        )
+        if not sum_resp.get("ok"):
+            return None
+
+        handoff_id = sum_resp["data"]["record_id"]
+        # Re-read session fresh and link handoff_summary_id + processing_checkpoint
+        ses_fresh = self.index.get_record(session_id)
+        if ses_fresh is None:
+            return handoff_id
+        target_path = Path(ses_fresh["file_path"])
+        self._save_prior_revision(ses_fresh, target_path, actor=client.client_id, reason="Attached handoff summary")
+        meta = dict(ses_fresh["metadata"])
+        meta["handoff_summary_id"] = handoff_id
+        meta["processing_checkpoint"] = len(events)
+        meta["revision"] = int(meta["revision"]) + 1
+        self.schemas.validate("session", meta)
+
+        new_body = ses_fresh["body"].rstrip() + f"\n\n## Handoff Summary\n- [[{handoff_id}]]\n"
+        rendered = render_markdown(meta, new_body)
+        entry = self.journal.execute(
+            operation="attach_handoff_summary",
+            ops=[
+                FileMutationOp(
+                    path=target_path,
+                    action="write",
+                    after_content=rendered,
+                    expected_before_hash=ses_fresh["content_hash"],
+                )
+            ],
+            metadata={"session_id": session_id, "handoff_summary_id": handoff_id, "scope_id": scope_id},
+        )
+        self.journal.mark_projecting(entry["mutation_id"])
+        self.index.upsert_record(
+            record_id=session_id,
+            kind="session",
+            meta=meta,
+            body=new_body,
+            file_path=target_path,
+            raw_hash=content_hash(rendered),
+        )
+        self.journal.mark_completed(entry["mutation_id"])
+        return handoff_id
 
     def health(self) -> dict[str, Any]:
         usage = shutil.disk_usage(self.config.data_root)

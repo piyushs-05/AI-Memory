@@ -49,6 +49,26 @@ def _open(core: MemoryCore, client, scopes=None):
     return resp["data"]["context_id"]
 
 
+def _capture_event(core: MemoryCore, client, ctx: str, scope_id: str, content: str, key_prefix: str) -> str:
+    ses = core.dispatch(
+        client=client,
+        operation="start_session",
+        context_id=ctx,
+        idempotency_key=f"{key_prefix}-ses",
+        payload={"source_application": "pytest", "capture_coverage": "partial_events", "scope_id": scope_id},
+    )
+    assert ses["ok"], ses
+    ev = core.dispatch(
+        client=client,
+        operation="append_events",
+        context_id=ctx,
+        idempotency_key=f"{key_prefix}-evt",
+        payload={"session_id": ses["data"]["session_id"], "events": [{"speaker": "user", "content": content}]},
+    )
+    assert ev["ok"], ev
+    return ev["data"]["accepted_ids"][0]
+
+
 def test_idempotency_and_capture_deduplication(env):
     core, owner = env["core"], env["owner"]
     ctx = _open(core, owner)
@@ -217,6 +237,9 @@ def test_cross_scope_isolation_and_no_existence_leak(env):
     work_ctx = _open(core, work_only)
 
     # Create a personal memory and a work memory linking to it
+    p_evt = _capture_event(core, owner, owner_ctx, "personal/life", "Doctor visit note.", "p-evt")
+    w_evt = _capture_event(core, owner, owner_ctx, "work/projects", "Selected lightweight gateway.", "w-evt")
+
     p_mem = core.dispatch(
         client=owner,
         operation="create_memory",
@@ -228,7 +251,7 @@ def test_cross_scope_isolation_and_no_existence_leak(env):
             "title": "Private Medical Appointment",
             "body": "Secret personal note about doctor visit.",
             "origin": "explicit_user_statement",
-            "sources": [{"record_id": "evt_manual_1"}],
+            "sources": [{"record_id": p_evt}],
         },
     )["data"]["record_id"]
 
@@ -243,7 +266,7 @@ def test_cross_scope_isolation_and_no_existence_leak(env):
             "title": "API Gateway Choice",
             "body": "Selected lightweight gateway.",
             "origin": "explicit_user_statement",
-            "sources": [{"record_id": "evt_manual_2"}],
+            "sources": [{"record_id": w_evt}],
             "relations": [{"type": "related_to", "target_id": p_mem}],
         },
     )["data"]["record_id"]
@@ -281,6 +304,7 @@ def test_manual_obsidian_edit_preserved_and_rename_keeps_identity(env):
     core, owner, config = env["core"], env["owner"], env["config"]
     ctx = _open(core, owner)
 
+    obs_evt = _capture_event(core, owner, ctx, "personal", "Original content.", "obs-evt")
     mem_id = core.dispatch(
         client=owner,
         operation="create_memory",
@@ -292,7 +316,7 @@ def test_manual_obsidian_edit_preserved_and_rename_keeps_identity(env):
             "title": "Editor Note",
             "body": "Original content.",
             "origin": "explicit_user_statement",
-            "sources": [{"record_id": "evt_obs_1"}],
+            "sources": [{"record_id": obs_evt}],
         },
     )["data"]["record_id"]
 
@@ -332,6 +356,8 @@ def test_task_lifecycle_cycles_and_derived_views(env):
     core, owner, config = env["core"], env["owner"], env["config"]
     ctx = _open(core, owner)
 
+    t1_evt = _capture_event(core, owner, ctx, "work", "Ship v1 core.", "t1-evt")
+    t2_evt = _capture_event(core, owner, ctx, "work", "Write docs.", "t2-evt")
     t1 = core.dispatch(
         client=owner,
         operation="create_task",
@@ -342,7 +368,7 @@ def test_task_lifecycle_cycles_and_derived_views(env):
             "title": "Ship v1 core",
             "status": "next",
             "due_date": "2020-01-01",
-            "sources": [{"record_id": "evt_t1"}],
+            "sources": [{"record_id": t1_evt}],
         },
     )["data"]["record_id"]
 
@@ -356,7 +382,7 @@ def test_task_lifecycle_cycles_and_derived_views(env):
             "title": "Write docs",
             "status": "next",
             "depends_on": [t1],
-            "sources": [{"record_id": "evt_t2"}],
+            "sources": [{"record_id": t2_evt}],
         },
     )["data"]["record_id"]
 
@@ -576,6 +602,7 @@ def test_dynamic_areas_nested_scopes_and_custom_folders(env):
     assert (config.vault_dir / "Academics" / "TASKS.md").is_file()
 
     # Nested sub-scope automatically creates nested folders inside Academics/
+    acad_evt1 = _capture_event(core, wildcard_owner, owner_ctx, "academics/semester-6/os", "Multi-level page tables.", "acad-e1")
     nested_mem = core.dispatch(
         client=wildcard_owner,
         operation="create_memory",
@@ -587,7 +614,7 @@ def test_dynamic_areas_nested_scopes_and_custom_folders(env):
             "title": "Page Table Walk",
             "body": "Multi-level page tables save memory for sparse address spaces.",
             "origin": "explicit_user_statement",
-            "sources": [{"record_id": "evt_acad_1"}],
+            "sources": [{"record_id": acad_evt1}],
         },
     )
     assert nested_mem["ok"], nested_mem
@@ -596,6 +623,7 @@ def test_dynamic_areas_nested_scopes_and_custom_folders(env):
     assert rel.parts[:4] == ("Academics", "Semester-6", "Os", "Memories")
 
     # Custom folder subpath inside Personal/ works dynamically
+    photo_evt = _capture_event(core, wildcard_owner, owner_ctx, "personal", "35mm prime lens notes.", "photo-e1")
     custom_mem = core.dispatch(
         client=wildcard_owner,
         operation="create_memory",
@@ -608,7 +636,7 @@ def test_dynamic_areas_nested_scopes_and_custom_folders(env):
             "title": "35mm Prime Notes",
             "body": "Great for street photography.",
             "origin": "explicit_user_statement",
-            "sources": [{"record_id": "evt_photo_1"}],
+            "sources": [{"record_id": photo_evt}],
         },
     )
     assert custom_mem["ok"], custom_mem
@@ -617,6 +645,7 @@ def test_dynamic_areas_nested_scopes_and_custom_folders(env):
     assert c_rel.parts[:4] == ("Personal", "Hobbies", "Photography", "Lenses")
 
     # Task under new area populates Academics/TASKS.md dynamically
+    acad_evt2 = _capture_event(core, wildcard_owner, owner_ctx, "academics/semester-6", "Submit OS lab report.", "acad-e2")
     acad_task = core.dispatch(
         client=wildcard_owner,
         operation="create_task",
@@ -626,7 +655,7 @@ def test_dynamic_areas_nested_scopes_and_custom_folders(env):
             "scope_id": "academics/semester-6",
             "title": "Submit OS lab report",
             "status": "next",
-            "sources": [{"record_id": "evt_acad_2"}],
+            "sources": [{"record_id": acad_evt2}],
         },
     )
     assert acad_task["ok"]

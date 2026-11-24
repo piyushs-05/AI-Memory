@@ -138,9 +138,31 @@ class AreaRegistry:
 
         areas = self.ensure_initialized()
         existing = areas.get(norm, {})
+        target_folder = existing.get("folder") or folder_name
+
+        # Prevent case-insensitive folder collisions across distinct areas (R15)
+        for other_slug, other_cfg in areas.items():
+            if other_slug == norm:
+                continue
+            other_folder = str(other_cfg.get("folder") or "")
+            if other_folder.lower() == target_folder.lower():
+                raise MemoryServiceError(
+                    "validation_failed",
+                    f"Folder '{target_folder}' is already owned by area '{other_slug}'",
+                )
+
+        # Reject silently adopting an unmanaged existing top-level directory for a brand-new area
+        if norm not in areas and create_in_vault:
+            candidate_dir = self._config.vault_dir / target_folder
+            if candidate_dir.exists():
+                raise MemoryServiceError(
+                    "validation_failed",
+                    f"Directory '{target_folder}' already exists in vault; choose a distinct folder name",
+                )
+
         merged_subs = list(dict.fromkeys(list(existing.get("subfolders") or []) + validated_subs))
         entry = {
-            "folder": existing.get("folder") or folder_name,
+            "folder": target_folder,
             "description": description or existing.get("description") or f"Area for {norm}.",
             "subfolders": merged_subs,
             "has_tasks_dashboard": has_tasks_dashboard,

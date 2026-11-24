@@ -13,6 +13,7 @@ from .config import MemoryConfig
 from .core import MemoryCore
 from .http_server import make_http_server
 from .mcp_server import serve_stdio
+from .worker import BackgroundWorker
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -37,6 +38,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_mcp.add_argument("--token-env", default="AI_MEMORY_TOKEN", help="Environment variable holding bearer token")
 
     sub.add_parser("rebuild-index", help="Rebuild SQLite FTS5 and relationship index from vault Markdown")
+    sub.add_parser("reconcile", help="Reconcile manual Obsidian edits and new files into SQLite")
+    sub.add_parser("run-worker", help="Process all pending consolidation and document-extraction jobs once")
     sub.add_parser("recover", help="Run startup journal recovery and print report")
     sub.add_parser("health", help="Print service health metadata")
     sub.add_parser("list-areas", help="List configured top-level vault areas and subfolders")
@@ -98,6 +101,22 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"reindexed_records": count}))
         return 0
 
+    if args.command == "reconcile":
+        core = MemoryCore(config)
+        summary = core.index.reconcile_vault(config.vault_dir)
+        core.refresh_derived_views()
+        core.close()
+        print(json.dumps(summary))
+        return 0
+
+    if args.command == "run-worker":
+        core = MemoryCore(config)
+        worker = BackgroundWorker(core)
+        outcomes = worker.run_once()
+        core.close()
+        print(json.dumps({"processed": outcomes}, indent=2))
+        return 0
+
     if args.command == "recover":
         core = MemoryCore(config)
         health = core.health()
@@ -135,6 +154,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "serve":
         core = MemoryCore(config)
+        worker = BackgroundWorker(core)
+        worker.start()
         server = make_http_server(core, host=args.host, port=args.port)
         print(f"ai-memory listening on http://{args.host}:{args.port} (data_root={config.data_root})", file=sys.stderr)
         try:
@@ -142,6 +163,7 @@ def main(argv: list[str] | None = None) -> int:
         except KeyboardInterrupt:
             pass
         finally:
+            worker.stop()
             server.server_close()
             core.close()
         return 0

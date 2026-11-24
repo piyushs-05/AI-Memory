@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from .config import MemoryConfig
+from .frontmatter import parse_markdown
 from .ids import local_today_str, utc_now_iso
 from .index import MemoryIndex, scope_permitted
 from .tasks import partition_daily_tasks
@@ -37,8 +38,16 @@ def build_bootstrap_packet(
 
     profile_excerpt: str | None = None
     profile_path = config.vault_dir / "PROFILE.md"
-    if scope_permitted("shared", allowed_scopes) and profile_path.is_file():
-        profile_excerpt = profile_path.read_text(encoding="utf-8")[:2000]
+    if profile_path.is_file():
+        raw_profile = profile_path.read_text(encoding="utf-8")
+        try:
+            p_meta, _ = parse_markdown(raw_profile)
+            # Default to 'personal' if scope_id is absent/malformed so private profiles never leak
+            p_scope = str(p_meta.get("scope_id") or "personal").strip().lower()
+        except Exception:
+            p_scope = "personal"
+        if p_scope and scope_permitted(p_scope, allowed_scopes):
+            profile_excerpt = raw_profile[:2000]
 
     return {
         "introduction": (

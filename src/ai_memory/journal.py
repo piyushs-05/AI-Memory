@@ -1,18 +1,26 @@
-"""Durable mutation journal and crash-recovery state machine (Design Section 10)."""
+"""Durable mutation journal, cross-process write lock, revision history, and crash recovery (Design Section 10)."""
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
+import shutil
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .config import MemoryConfig
 from .errors import MemoryServiceError
 from .frontmatter import content_hash
 from .ids import new_id, utc_now_iso
 from .storage import atomic_write_json, atomic_write_text, ensure_within, is_protected_policy_path
+
+if os.name != "nt":
+    import fcntl
+else:
+    fcntl = None  # type: ignore[assignment]
 
 
 @dataclass(frozen=True)
@@ -30,17 +38,40 @@ class MutationJournal:
     """
     Serialized mutation coordinator implementing:
     Received -> Validating -> Prepared -> Applying -> Committed -> Projecting -> Completed
-    with crash recovery (Recovering -> Applying | Aborted | RepairRequired).
+    with crash recovery (Recovering -> Applying | Aborted | RepairRequired),
+    re-verification before write (R10), durable idempotency correlation (R09),
+    and historical revision retention (R11).
     """
 
     def __init__(self, config: MemoryConfig) -> None:
         self._config = config
         self._lock = threading.RLock()
         self._config.journal_dir.mkdir(parents=True, exist_ok=True)
+        self._config.runtime_dir.mkdir(parents=True, exist_ok=True)
+        self._lock_file_path = self._config.runtime_dir / "write.lock"
 
     @property
     def lock(self) -> threading.RLock:
         return self._lock
+
+    @property
+    def revisions_dir(self) -> Path:
+        return self._config.records_dir / "revisions"
+
+    @contextlib.contextmanager
+    def mutation_boundary(self) -> Iterator[None]:
+        """Acquire both in-process RLock and cross-process advisory file lock (R08)."""
+        with self._lock:
+            if fcntl is None:
+                yield
+                return
+            self._lock_file_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._lock_file_path, "a+b") as lf:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
 
     def _journal_path(self, mutation_id: str) -> Path:
         return self._config.journal_dir / f"{mutation_id}.json"
@@ -49,29 +80,112 @@ class MutationJournal:
         entry["updated_at"] = utc_now_iso()
         atomic_write_json(self._journal_path(entry["mutation_id"]), entry)
 
+    # -- Historical Revision Store (R11) --------------------------------------
+
+    def save_revision_snapshot(
+        self,
+        *,
+        record_id: str,
+        revision: int,
+        actor: str,
+        reason: str,
+        metadata: dict[str, Any],
+        body: str,
+        raw_markdown: str,
+    ) -> Path:
+        """Persist a retrievable prior revision before overwriting a mutable record."""
+        rec_dir = ensure_within(self._config.records_dir, self.revisions_dir / record_id)
+        rec_dir.mkdir(parents=True, exist_ok=True)
+        snap_path = rec_dir / f"rev_{revision:04d}.json"
+        if not snap_path.exists():
+            atomic_write_json(
+                snap_path,
+                {
+                    "record_id": record_id,
+                    "revision": revision,
+                    "saved_at": utc_now_iso(),
+                    "superseded_by_actor": actor,
+                    "reason": reason,
+                    "metadata": metadata,
+                    "body": body,
+                    "raw_markdown": raw_markdown,
+                },
+            )
+        return snap_path
+
+    def list_revisions(self, record_id: str) -> list[dict[str, Any]]:
+        rec_dir = self.revisions_dir / record_id
+        if not rec_dir.is_dir():
+            return []
+        out: list[dict[str, Any]] = []
+        for p in sorted(rec_dir.glob("rev_*.json")):
+            out.append(json.loads(p.read_text(encoding="utf-8")))
+        return out
+
+    def delete_revision_history(self, record_id: str) -> bool:
+        """Remove all stored historical revisions for a forgotten record (R11/R13/R14)."""
+        rec_dir = self.revisions_dir / record_id
+        if rec_dir.is_dir():
+            shutil.rmtree(rec_dir)
+            return True
+        return False
+
+    # -- Durable Idempotency Correlation (R09) --------------------------------
+
+    def find_by_idempotency(self, client_id: str, idempotency_key: str) -> dict[str, Any] | None:
+        """Find any Committed/Projecting/Completed journal entry matching (client_id, idempotency_key)."""
+        with self._lock:
+            for jpath in sorted(self._config.journal_dir.glob("mut_*.json"), reverse=True):
+                try:
+                    entry = json.loads(jpath.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                if entry.get("client_id") == client_id and entry.get("idempotency_key") == idempotency_key:
+                    if entry.get("state") in ("Committed", "Projecting", "ProjectionPending", "Completed"):
+                        return entry
+        return None
+
+    def record_response(self, mutation_id: str, response: dict[str, Any]) -> None:
+        with self._lock:
+            path = self._journal_path(mutation_id)
+            if not path.exists():
+                return
+            entry = json.loads(path.read_text(encoding="utf-8"))
+            entry["response"] = response
+            self._persist(entry)
+
+    # -- Mutation Execution ---------------------------------------------------
+
     def execute(
         self,
         *,
         operation: str,
         ops: list[FileMutationOp],
         metadata: dict[str, Any] | None = None,
+        client_id: str | None = None,
+        idempotency_key: str | None = None,
+        request_hash: str | None = None,
         allow_protected: bool = False,
         fail_after_state: str | None = None,
     ) -> dict[str, Any]:
         """
-        Execute a multi-file mutation with durable journaling and external-edit detection.
-        `fail_after_state` is an optional test hook ("Prepared" or "Applying") to simulate crashes.
+        Execute a multi-file mutation with durable journaling, pre-prepare and pre-apply
+        external-edit detection (R10), and idempotency correlation (R09).
         """
-        with self._lock:
+        with self.mutation_boundary():
             mutation_id = new_id("mut")
             entry: dict[str, Any] = {
                 "mutation_id": mutation_id,
                 "operation": operation,
+                "client_id": client_id,
+                "idempotency_key": idempotency_key,
+                "request_hash": request_hash,
                 "state": "Received",
                 "created_at": utc_now_iso(),
                 "updated_at": utc_now_iso(),
                 "metadata": metadata or {},
                 "targets": [],
+                "response": None,
                 "error": None,
             }
 
@@ -127,11 +241,16 @@ class MutationJournal:
             if fail_after_state == "Prepared":
                 raise RuntimeError(f"Simulated crash after Prepared for {mutation_id}")
 
-            # 3. Applying: write/delete each target atomically
+            # 3. Applying: re-verify disk hashes right before replacing each target (R10)
             entry["state"] = "Applying"
             self._persist(entry)
             try:
                 self._apply_targets(prepared_targets, fail_midway=(fail_after_state == "Applying"))
+            except MemoryServiceError as exc:
+                entry["state"] = "Conflict" if exc.code == "revision_conflict" else "Aborted"
+                entry["error"] = exc.message
+                self._persist(entry)
+                raise
             except Exception as exc:
                 entry["error"] = str(exc)
                 self._persist(entry)
@@ -158,7 +277,6 @@ class MutationJournal:
                 return
             entry = json.loads(path.read_text(encoding="utf-8"))
             entry["state"] = "Completed"
-            # Strip bulky file bodies once completed to keep journal compact
             for target in entry.get("targets", []):
                 target.pop("after_content", None)
             self._persist(entry)
@@ -174,6 +292,25 @@ class MutationJournal:
             self._persist(entry)
 
     def _apply_targets(self, targets: list[dict[str, Any]], *, fail_midway: bool = False) -> None:
+        # Re-verify every target's current disk hash right before writing/deleting (R10)
+        for target in targets:
+            p = Path(target["path"])
+            cur_exists = p.exists()
+            cur_hash = content_hash(p.read_text(encoding="utf-8")) if cur_exists else None
+            if target["before_exists"]:
+                if cur_hash not in (target["before_hash"], target["after_hash"]):
+                    raise MemoryServiceError(
+                        "revision_conflict",
+                        "Intervening manual edit detected between prepare and apply; manual edit preserved",
+                        details={"expected_hash": target["before_hash"], "actual_hash": cur_hash},
+                    )
+            else:
+                if cur_exists and cur_hash != target["after_hash"]:
+                    raise MemoryServiceError(
+                        "revision_conflict",
+                        "Unexpected file appeared on disk between prepare and apply; preserved",
+                    )
+
         for idx, target in enumerate(targets):
             p = Path(target["path"])
             if target["action"] == "write":
@@ -191,7 +328,7 @@ class MutationJournal:
           otherwise quarantine as RepairRequired without overwriting manual edits.
         - Committed / Projecting / ProjectionPending: report for projection refresh.
         """
-        with self._lock:
+        with self.mutation_boundary():
             recovered: list[str] = []
             needs_projection: list[str] = []
             repair_required: list[str] = []

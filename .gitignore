@@ -7,8 +7,9 @@ __pycache__/
 dist/
 build/
 
-# Local scratch, machine-specific host docs & secrets
+# Local scratch, outputs, machine-specific host docs & secrets
 work/
+outputs/
 *-Host-Setup.md
 AGENTS.md
 scripts/*.local.ps1

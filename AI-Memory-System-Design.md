@@ -1,9 +1,9 @@
 # Portable AI Memory System — Design Reference
 
-Version: 0.2  
+Version: 0.3  
 Date: 2026-11-24  
-Status: Architecture baseline with proposed implementation contracts  
-Implementation status: v1 core, schemas, dynamic areas, and MCP/HTTP adapters implemented
+Status: Architecture baseline with v1 implementation status and dynamic area contract  
+Implementation status: v1 core, schemas, dynamic areas, revision history, cascading deletion, background worker, PDF/text extraction, and MCP/HTTP adapters implemented (see [Section 20: Implementation status matrix](#20-implementation-status-matrix))
 
 For host deployment conventions and client access patterns, see [Section 19: Host deployment conventions](#19-host-deployment-conventions).
 
@@ -559,5 +559,30 @@ Host-specific setup details (addresses, SSH aliases/key paths, host fingerprints
 - Data root (`AI_MEMORY_HOME`): `<data-root>/{vault,records,config,schemas,journal,runtime}` with owner-only permissions.
 - Client access: localhost bind (`127.0.0.1:8765`) over an SSH tunnel with scoped bearer tokens stored hashed in `$AI_MEMORY_HOME/config/credentials.json` (outside the vault).
 - Additional clients should generate their own dedicated Ed25519 SSH keys rather than sharing private keys through the vault or repository.
+
+## 20. Implementation status matrix and dynamic area contract
+
+### 20.1 Implementation status matrix
+
+| Capability | Status | Notes |
+| --- | --- | --- |
+| Canonical Markdown + YAML frontmatter + Draft 2020-12 JSON schemas | Implemented & verified | `schemas/*.schema.json`, `frontmatter.py`, `schemas.py` |
+| Dynamic areas (`config/areas.json`), nested scopes, custom folders | Implemented & verified | Unique case-insensitive folder ownership enforced; new folders do not grant new scope permissions |
+| Bearer auth, `credential ∩ context` re-check on every call, whole-response metadata filtering | Implemented & verified | `access.py`, `core.py`, `views.py` |
+| Source existence, scope inheritance, and quote verification | Implemented & verified | `_validate_sources` in `core.py` |
+| Cross-process write lock, durable idempotency correlation, pre-apply edit check, revision history | Implemented & verified | `journal.py`, `records/revisions/<id>/rev_*.json` |
+| Cascading `forget_record` (derived memories, revision history, document originals, extraction caches, jobs, tombstones) | Implemented & verified | `core.py`, `documents.py` |
+| Startup reconciliation, on-read manual edit sync, periodic worker reconciliation | Implemented & verified | `index.py`, `worker.py`; unmanaged ordinary Markdown adoption remains explicit |
+| Policy & raw event reads via `read_page` | Implemented & verified | Allowlisted `START-HERE.md`, `System/Rules/*.md`, `System/Templates/*.md`, and scoped `evt_*` |
+| Background worker + bounded PDF/text/OCR extraction (`pdftotext`/`pdfinfo`/`tesseract`) | Implemented & verified | Started automatically by `ai-memory serve` and callable via `ai-memory run-worker` |
+| Gemini consolidation adapter (`GeminiConsolidationProvider`) | Partial (implemented, unconfigured) | Offline `StubConsolidationProvider` is active by default; Gemini requires verified credentials, quota, and scope external-processing approval |
+| Automated off-host backup & systemd reboot autostart | Planned | Not yet configured on deployment host |
+
+### 20.2 Areas, scopes, and folders
+
+- **Area:** A registered organizational root in `$AI_MEMORY_HOME/config/areas.json` (defaults: `shared`, `work`, `personal`; extensible via `register_area` or `ai-memory add-area`). Each area owns a unique case-insensitive top-level folder.
+- **Scope:** Hierarchical access-policy ownership (`<area>` or `<area>/<subscope>/...`, up to 6 lowercase alphanumeric/`-`/`_` segments). Effective access is always `current credential scopes ∩ active context scopes`.
+- **Folder:** Physical placement inside the Obsidian vault. Creating a folder or moving a note never widens scope permissions.
+
 
 

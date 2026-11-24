@@ -55,6 +55,14 @@ CREATE TABLE IF NOT EXISTS relations (
 
 CREATE INDEX IF NOT EXISTS idx_relations_target ON relations(target_id);
 
+CREATE TABLE IF NOT EXISTS record_sources (
+    record_id TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    PRIMARY KEY (record_id, source_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_record_sources_source ON record_sources(source_id);
+
 CREATE TABLE IF NOT EXISTS events (
     id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL,
@@ -223,6 +231,13 @@ class MemoryIndex:
                         "INSERT OR IGNORE INTO relations(source_id, rel_type, target_id) VALUES (?, ?, ?)",
                         (record_id, rel["type"], rel["target_id"]),
                     )
+            self._conn.execute("DELETE FROM record_sources WHERE record_id = ?", (record_id,))
+            for src in meta.get("sources", []) or []:
+                if isinstance(src, dict) and src.get("record_id"):
+                    self._conn.execute(
+                        "INSERT OR IGNORE INTO record_sources(record_id, source_id) VALUES (?, ?)",
+                        (record_id, str(src["record_id"])),
+                    )
             self.set_meta("index_updated_at", utc_now_iso())
             self._conn.commit()
 
@@ -231,7 +246,20 @@ class MemoryIndex:
             self._conn.execute("DELETE FROM records WHERE id = ?", (record_id,))
             self._conn.execute("DELETE FROM records_fts WHERE id = ?", (record_id,))
             self._conn.execute("DELETE FROM relations WHERE source_id = ? OR target_id = ?", (record_id, record_id))
+            self._conn.execute("DELETE FROM record_sources WHERE record_id = ? OR source_id = ?", (record_id, record_id))
             self._conn.commit()
+
+    def list_records_citing(self, source_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT r.* FROM record_sources rs
+                JOIN records r ON r.id = rs.record_id
+                WHERE rs.source_id = ?
+                """,
+                (source_id,),
+            ).fetchall()
+        return [self._row_to_record(r) for r in rows]
 
     def get_record(self, record_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -281,46 +309,66 @@ class MemoryIndex:
         include_archived: bool = False,
         limit: int = 20,
     ) -> list[dict[str, Any]]:
-        """Scoped FTS5 search: scope restriction is enforced before returning any row."""
+        """Scoped FTS5 search: scope, kind, and archive predicates are enforced in SQL BEFORE LIMIT (R16)."""
+        if not permitted_scopes:
+            return []
+
+        where_clauses: list[str] = []
+        params: list[Any] = []
+
+        # Scope predicate in SQL
+        norm_scopes = [s.strip().lower() for s in permitted_scopes if s.strip()]
+        if "*" not in norm_scopes:
+            scope_parts: list[str] = []
+            for s in norm_scopes:
+                scope_parts.append("(lower(r.scope_id) = ? OR lower(r.scope_id) LIKE ?)")
+                params.extend([s, f"{s}/%"])
+            where_clauses.append("(" + " OR ".join(scope_parts) + ")")
+
+        if kind:
+            where_clauses.append("r.kind = ?")
+            params.append(kind)
+        if not include_archived:
+            where_clauses.append("r.archived = 0")
+
         clean_q = query.strip()
         with self._lock:
             if clean_q:
-                # Escape double quotes and run prefix/token FTS5 match safely
                 tokens = [t.replace('"', "") for t in clean_q.split() if t.replace('"', "")]
                 fts_expr = " AND ".join(f'"{t}"*' for t in tokens) if tokens else '""'
+                sql_where = " AND ".join(["records_fts MATCH ?"] + where_clauses)
                 try:
                     rows = self._conn.execute(
-                        """
+                        f"""
                         SELECT r.*, snippet(records_fts, 2, '[', ']', '...', 24) AS excerpt
                         FROM records_fts
                         JOIN records r ON r.id = records_fts.id
-                        WHERE records_fts MATCH ?
+                        WHERE {sql_where}
                         ORDER BY bm25(records_fts)
                         LIMIT ?
                         """,
-                        (fts_expr, limit * 4),
+                        [fts_expr, *params, limit],
                     ).fetchall()
                 except sqlite3.OperationalError:
                     rows = []
             else:
+                sql_where = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
                 rows = self._conn.execute(
-                    "SELECT *, substr(body_text, 1, 200) AS excerpt FROM records ORDER BY updated_at DESC LIMIT ?",
-                    (limit * 4,),
+                    f"""
+                    SELECT r.*, substr(r.body_text, 1, 200) AS excerpt
+                    FROM records r
+                    {sql_where}
+                    ORDER BY r.updated_at DESC
+                    LIMIT ?
+                    """,
+                    [*params, limit],
                 ).fetchall()
 
         out: list[dict[str, Any]] = []
         for row in rows:
             rec = self._row_to_record(row)
-            if not scope_permitted(rec["scope_id"], permitted_scopes):
-                continue
-            if kind and rec["kind"] != kind:
-                continue
-            if not include_archived and rec["archived"]:
-                continue
             rec["excerpt"] = row["excerpt"]
             out.append(rec)
-            if len(out) >= limit:
-                break
         return out
 
     def get_relations(self, record_id: str) -> list[dict[str, str]]:
@@ -332,20 +380,42 @@ class MemoryIndex:
             return [dict(r) for r in rows]
 
     def rebuild_from_vault(self, vault_dir: Path) -> int:
-        """Rebuild records, FTS5, and relations tables solely from canonical Markdown files."""
+        """Rebuild records, FTS5, relations, and record_sources solely from canonical Markdown files."""
         with self._lock:
             self._conn.execute("DELETE FROM records")
             self._conn.execute("DELETE FROM records_fts")
             self._conn.execute("DELETE FROM relations")
+            self._conn.execute("DELETE FROM record_sources")
             self._conn.commit()
 
         count = 0
         for md_path in sorted(vault_dir.rglob("*.md")):
+            if self._index_markdown_file(vault_dir, md_path):
+                count += 1
+        self.set_meta("last_rebuild_at", utc_now_iso())
+        return count
+
+    def reconcile_vault(self, vault_dir: Path) -> dict[str, int]:
+        """
+        Incremental reconciliation of vault Markdown files into SQLite (R12).
+        Discovers new structured notes, updates manually edited/renamed notes, and removes deleted notes.
+        """
+        seen_ids: set[str] = set()
+        updated = 0
+        added = 0
+        removed = 0
+
+        existing_map: dict[str, tuple[str, str]] = {}
+        with self._lock:
+            for row in self._conn.execute("SELECT id, file_path, content_hash FROM records").fetchall():
+                existing_map[row["id"]] = (row["file_path"], row["content_hash"])
+
+        for md_path in sorted(vault_dir.rglob("*.md")):
             rel = md_path.relative_to(vault_dir)
             if rel.parts and rel.parts[0] == "System":
                 continue
-            raw = md_path.read_text(encoding="utf-8")
             try:
+                raw = md_path.read_text(encoding="utf-8")
                 meta, body = parse_markdown(raw)
             except Exception:
                 continue
@@ -355,17 +425,81 @@ class MemoryIndex:
             kind = _infer_kind(record_id, str(meta.get("type", "")))
             if kind is None:
                 continue
-            self.upsert_record(
-                record_id=record_id,
-                kind=kind,
-                meta=meta,
-                body=body,
-                file_path=md_path,
-                raw_hash=content_hash(raw),
-            )
-            count += 1
-        self.set_meta("last_rebuild_at", utc_now_iso())
-        return count
+            seen_ids.add(record_id)
+            rhash = content_hash(raw)
+            prev = existing_map.get(record_id)
+            if prev is None:
+                self.upsert_record(
+                    record_id=record_id, kind=kind, meta=meta, body=body, file_path=md_path, raw_hash=rhash
+                )
+                added += 1
+            elif prev[0] != str(md_path) or prev[1] != rhash:
+                self.upsert_record(
+                    record_id=record_id, kind=kind, meta=meta, body=body, file_path=md_path, raw_hash=rhash
+                )
+                updated += 1
+
+        for stale_id in set(existing_map.keys()) - seen_ids:
+            stale_path = Path(existing_map[stale_id][0])
+            if not stale_path.exists():
+                self.delete_record(stale_id)
+                removed += 1
+
+        self.set_meta("last_reconcile_at", utc_now_iso())
+        return {"added": added, "updated": updated, "removed": removed}
+
+    def reconcile_record_file(self, record_id: str) -> dict[str, Any] | None:
+        """Check if a single record's file changed on disk and refresh its index entry before read (R12)."""
+        rec = self.get_record(record_id)
+        if rec is None:
+            return None
+        path = Path(rec["file_path"])
+        if not path.is_file():
+            return rec
+        raw = path.read_text(encoding="utf-8")
+        rhash = content_hash(raw)
+        if rhash == rec["content_hash"]:
+            return rec
+        try:
+            meta, body = parse_markdown(raw)
+        except Exception:
+            return rec
+        if meta.get("id") != record_id:
+            return rec
+        self.upsert_record(
+            record_id=record_id,
+            kind=rec["kind"],
+            meta=meta,
+            body=body,
+            file_path=path,
+            raw_hash=rhash,
+        )
+        return self.get_record(record_id)
+
+    def _index_markdown_file(self, vault_dir: Path, md_path: Path) -> bool:
+        rel = md_path.relative_to(vault_dir)
+        if rel.parts and rel.parts[0] == "System":
+            return False
+        raw = md_path.read_text(encoding="utf-8")
+        try:
+            meta, body = parse_markdown(raw)
+        except Exception:
+            return False
+        record_id = meta.get("id")
+        if not isinstance(record_id, str) or not meta.get("scope_id"):
+            return False
+        kind = _infer_kind(record_id, str(meta.get("type", "")))
+        if kind is None:
+            return False
+        self.upsert_record(
+            record_id=record_id,
+            kind=kind,
+            meta=meta,
+            body=body,
+            file_path=md_path,
+            raw_hash=content_hash(raw),
+        )
+        return True
 
     # -- Events ---------------------------------------------------------------
 
@@ -535,19 +669,60 @@ class MemoryIndex:
             out.append(item)
         return out
 
-    def update_job_status(self, job_id: str, status: str, *, last_error: str | None = None, inc_attempts: bool = False) -> None:
+    def update_job_status(
+        self,
+        job_id: str,
+        status: str,
+        *,
+        last_error: str | None = None,
+        inc_attempts: bool = False,
+        lease_until: str | None = None,
+    ) -> None:
         with self._lock:
             if inc_attempts:
                 self._conn.execute(
-                    "UPDATE jobs SET status=?, attempts=attempts+1, last_error=?, updated_at=? WHERE job_id=?",
-                    (status, last_error, utc_now_iso(), job_id),
+                    "UPDATE jobs SET status=?, attempts=attempts+1, lease_until=?, last_error=?, updated_at=? WHERE job_id=?",
+                    (status, lease_until, last_error, utc_now_iso(), job_id),
                 )
             else:
                 self._conn.execute(
-                    "UPDATE jobs SET status=?, last_error=?, updated_at=? WHERE job_id=?",
-                    (status, last_error, utc_now_iso(), job_id),
+                    "UPDATE jobs SET status=?, lease_until=?, last_error=?, updated_at=? WHERE job_id=?",
+                    (status, lease_until, last_error, utc_now_iso(), job_id),
                 )
             self._conn.commit()
+
+    def recover_abandoned_jobs(self) -> int:
+        """Reset any 'running' jobs whose lease expired (or after restart) back to 'retry_wait' or 'failed'."""
+        now = utc_now_iso()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT job_id, attempts, max_attempts, lease_until FROM jobs WHERE status = 'running'"
+            ).fetchall()
+            recovered = 0
+            for row in rows:
+                if row["lease_until"] and row["lease_until"] > now:
+                    continue
+                next_status = "failed" if row["attempts"] >= row["max_attempts"] else "retry_wait"
+                self._conn.execute(
+                    "UPDATE jobs SET status=?, lease_until=NULL, last_error=?, updated_at=? WHERE job_id=?",
+                    (next_status, "Recovered abandoned running job on startup", now, row["job_id"]),
+                )
+                recovered += 1
+            self._conn.commit()
+        return recovered
+
+    def delete_jobs_for_target(self, target_id: str) -> int:
+        """Remove pending/retry jobs referencing a forgotten record or document."""
+        with self._lock:
+            rows = self._conn.execute("SELECT job_id, payload_json FROM jobs").fetchall()
+            removed = 0
+            for row in rows:
+                payload = json.loads(row["payload_json"])
+                if target_id in payload.values():
+                    self._conn.execute("DELETE FROM jobs WHERE job_id = ?", (row["job_id"],))
+                    removed += 1
+            self._conn.commit()
+        return removed
 
     def stats(self) -> dict[str, Any]:
         with self._lock:

@@ -88,3 +88,73 @@ class StubConsolidationProvider:
                 "extracted_at": utc_now_iso(),
             },
         )
+
+
+class GeminiConsolidationProvider:
+    """
+    Optional replaceable Gemini API consolidation provider (Design Section 14).
+    Activated ONLY when explicitly configured with an API key outside the vault and
+    scope external-processing approval. Returns structured proposals only, never raw edits.
+    """
+
+    provider_name = "gemini-api"
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model: str = "gemini-2.5-flash",
+        allowed_external_scopes: tuple[str, ...] = (),
+        timeout_seconds: int = 30,
+    ) -> None:
+        self._api_key = api_key
+        self.model_name = model
+        self._allowed_external_scopes = allowed_external_scopes
+        self._timeout = timeout_seconds
+
+    def consolidate(
+        self,
+        *,
+        events: list[dict[str, Any]],
+        relevant_memories: list[dict[str, Any]],
+        schema_version: str,
+        policy_constraints: dict[str, Any],
+    ) -> ConsolidationResult:
+        import json
+        import urllib.request
+
+        scope_id = str(policy_constraints.get("scope_id") or "")
+        if self._allowed_external_scopes and scope_id not in self._allowed_external_scopes:
+            raise PermissionError(f"Scope '{scope_id}' is not approved for external Gemini processing")
+
+        prompt = (
+            "You are a strict memory consolidation extractor. Given source events and existing memories, "
+            "return ONLY valid JSON with key 'proposals' (array of memory or task proposals). "
+            "Rules: cite exact source record_id and verbatim quote; temporary activity is type='state', "
+            "not 'preference'; assistant suggestions are kind='task', status='inbox', proposal=true; "
+            "inferences must have origin='inference' and status='uncertain'.\n"
+            f"Events: {json.dumps(events, ensure_ascii=False)}\n"
+            f"Existing memories: {json.dumps([{'id': m['id'], 'title': m['title'], 'type': m['record_type'], 'status': m['status']} for m in relevant_memories], ensure_ascii=False)}"
+        )
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent?key={self._api_key}"
+        body = json.dumps(
+            {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"responseMimeType": "application/json", "temperature": 0.1},
+            }
+        ).encode("utf-8")
+        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+            raw = json.loads(resp.read().decode("utf-8"))
+        text = raw["candidates"][0]["content"]["parts"][0]["text"]
+        parsed = json.loads(text)
+        return ConsolidationResult(
+            proposals=list(parsed.get("proposals") or []),
+            usage_metadata=dict(raw.get("usageMetadata") or {}),
+            provider_metadata={
+                "provider": self.provider_name,
+                "model": self.model_name,
+                "schema_version": schema_version,
+                "extracted_at": utc_now_iso(),
+            },
+        )

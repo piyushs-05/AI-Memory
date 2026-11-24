@@ -46,6 +46,8 @@ class MutationJournal:
     def __init__(self, config: MemoryConfig) -> None:
         self._config = config
         self._lock = threading.RLock()
+        self._os_lock_depth = 0
+        self._os_lock_file: Any = None
         self._config.journal_dir.mkdir(parents=True, exist_ok=True)
         self._config.runtime_dir.mkdir(parents=True, exist_ok=True)
         self._lock_file_path = self._config.runtime_dir / "write.lock"
@@ -60,18 +62,38 @@ class MutationJournal:
 
     @contextlib.contextmanager
     def mutation_boundary(self) -> Iterator[None]:
-        """Acquire both in-process RLock and cross-process advisory file lock (R08)."""
+        """
+        Acquire both in-process RLock and cross-process advisory file lock (R08, F01).
+        Reentrant within the same process: opens and flocks the lock file once on the
+        outermost entry, preventing nested flock self-deadlock on Linux.
+        """
         with self._lock:
             if fcntl is None:
                 yield
                 return
-            self._lock_file_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self._lock_file_path, "a+b") as lf:
-                fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+            acquired_os_lock = False
+            if self._os_lock_depth == 0:
+                self._lock_file_path.parent.mkdir(parents=True, exist_ok=True)
+                lf = open(self._lock_file_path, "a+b")
                 try:
-                    yield
-                finally:
-                    fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+                    fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+                except Exception:
+                    lf.close()
+                    raise
+                self._os_lock_file = lf
+                acquired_os_lock = True
+            self._os_lock_depth += 1
+            try:
+                yield
+            finally:
+                self._os_lock_depth -= 1
+                if acquired_os_lock and self._os_lock_file is not None:
+                    lf = self._os_lock_file
+                    self._os_lock_file = None
+                    try:
+                        fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+                    finally:
+                        lf.close()
 
     def _journal_path(self, mutation_id: str) -> Path:
         return self._config.journal_dir / f"{mutation_id}.json"

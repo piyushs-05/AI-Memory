@@ -173,15 +173,19 @@ class MemoryCore:
 
             req_hash = canonical_request_hash(operation, inp)
 
-            # Fast-path unlocked check (allows concurrent callers to hit idempotency check cleanly)
-            cached = self._check_idempotency_receipt(client.client_id, idempotency_key, operation, req_hash)
+            # Fast-path unlocked check (enforces current context scope on cached results: F08)
+            cached = self._check_idempotency_receipt(
+                client.client_id, idempotency_key, operation, req_hash, ctx["allowed_scopes"]
+            )
             if cached is not None:
                 return cached
 
             # Coordinated mutation boundary prevents concurrent duplicates (R08) and recovers
-            # committed journal entries if SQLite receipt persistence previously failed (R09)
+            # committed journal entries even if crash occurred before record_response or save_idempotency (R09, F04)
             with self.journal.mutation_boundary():
-                cached_locked = self._check_idempotency_locked(client.client_id, idempotency_key, operation, req_hash)
+                cached_locked = self._check_idempotency_locked(
+                    client.client_id, idempotency_key, operation, req_hash, ctx["allowed_scopes"]
+                )
                 if cached_locked is not None:
                     return cached_locked
 
@@ -204,6 +208,7 @@ class MemoryCore:
                     "policy_version": self.config.policy_version,
                     "warnings": warnings,
                 }
+                mut_scope = self._infer_mutation_scope(operation, inp, data)
                 mut_id = data.get("mutation_id")
                 if isinstance(mut_id, str):
                     self.journal.record_response(mut_id, response)
@@ -213,6 +218,7 @@ class MemoryCore:
                     operation=operation,
                     request_hash=req_hash,
                     response=response,
+                    scope_id=mut_scope,
                 )
                 return response
 
@@ -225,8 +231,26 @@ class MemoryCore:
                 "warnings": warnings,
             }
 
+    def _infer_mutation_scope(self, operation: str, inp: dict[str, Any], data: dict[str, Any]) -> str | None:
+        for src in (data, inp):
+            val = src.get("scope_id") or src.get("slug")
+            if isinstance(val, str) and val.strip():
+                return val.strip().lower()
+        rec_id = data.get("record_id") or data.get("session_id") or data.get("document_id") or inp.get("record_id") or inp.get("session_id")
+        if isinstance(rec_id, str):
+            return self._resolve_source_scope(rec_id)
+        return None
+
+    def _authorize_cached_scope(self, receipt_scope: str | None, allowed_scopes: list[str]) -> None:
+        """Ensure a cached or recovered mutation outcome is permitted in the caller's current context (F08)."""
+        if receipt_scope and not scope_permitted(receipt_scope, allowed_scopes):
+            raise MemoryServiceError(
+                "not_found_or_unavailable",
+                "Operation result is not accessible in the current context",
+            )
+
     def _check_idempotency_receipt(
-        self, client_id: str, key: str, operation: str, req_hash: str
+        self, client_id: str, key: str, operation: str, req_hash: str, allowed_scopes: list[str]
     ) -> dict[str, Any] | None:
         existing = self.index.get_idempotency(client_id, key)
         if existing is not None:
@@ -235,11 +259,12 @@ class MemoryCore:
                     "idempotency_conflict",
                     "Idempotency key already used with a different operation or payload",
                 )
+            self._authorize_cached_scope(existing.get("scope_id"), allowed_scopes)
             return json.loads(existing["response_json"])
         return None
 
     def _check_idempotency_locked(
-        self, client_id: str, key: str, operation: str, req_hash: str
+        self, client_id: str, key: str, operation: str, req_hash: str, allowed_scopes: list[str]
     ) -> dict[str, Any] | None:
         # 1. Direct SQLite check (bypasses any test hook on get_idempotency to prevent barrier deadlock)
         with self.index._lock:
@@ -253,9 +278,10 @@ class MemoryCore:
                     "idempotency_conflict",
                     "Idempotency key already used with a different operation or payload",
                 )
+            self._authorize_cached_scope(row["scope_id"], allowed_scopes)
             return json.loads(row["response_json"])
 
-        # 2. Durable journal fallback (R09: recovers if previous run crashed before save_idempotency)
+        # 2. Durable journal fallback (R09 & F04: recovers even if crash occurred before record_response)
         j_entry = self.journal.find_by_idempotency(client_id, key)
         if j_entry is not None:
             if j_entry.get("request_hash") != req_hash or j_entry.get("operation") != operation:
@@ -263,16 +289,42 @@ class MemoryCore:
                     "idempotency_conflict",
                     "Idempotency key already committed with a different operation or payload",
                 )
+            meta = j_entry.get("metadata") or {}
+            mut_scope = meta.get("scope_id")
             recovered_resp = j_entry.get("response")
-            if isinstance(recovered_resp, dict):
-                self.index.save_idempotency(
-                    client_id=client_id,
-                    key=key,
-                    operation=operation,
-                    request_hash=req_hash,
-                    response=recovered_resp,
-                )
-                return recovered_resp
+            if not isinstance(recovered_resp, dict):
+                # Reconstruct durable outcome from committed journal metadata & disk state (F04)
+                self.index.reconcile_vault(self.config.vault_dir)
+                reconstructed_data: dict[str, Any] = {"mutation_id": j_entry["mutation_id"], "recovered": True}
+                for field in ("record_id", "session_id", "document_id", "scope_id"):
+                    if meta.get(field) is not None:
+                        reconstructed_data[field] = meta[field]
+                rid = meta.get("record_id") or meta.get("session_id") or meta.get("document_id")
+                if isinstance(rid, str):
+                    rec = self.index.get_record(rid)
+                    if rec is not None:
+                        reconstructed_data["revision"] = rec["revision"]
+                        reconstructed_data["status"] = rec["status"]
+                        mut_scope = mut_scope or rec["scope_id"]
+                recovered_resp = {
+                    "request_id": new_id("req"),
+                    "ok": True,
+                    "data": reconstructed_data,
+                    "policy_version": self.config.policy_version,
+                    "warnings": ["Recovered committed outcome from mutation journal"],
+                }
+                self.journal.record_response(j_entry["mutation_id"], recovered_resp)
+
+            self.index.save_idempotency(
+                client_id=client_id,
+                key=key,
+                operation=operation,
+                request_hash=req_hash,
+                response=recovered_resp,
+                scope_id=mut_scope,
+            )
+            self._authorize_cached_scope(mut_scope, allowed_scopes)
+            return recovered_resp
         return None
 
     # -- Context & Access -----------------------------------------------------
@@ -402,7 +454,7 @@ class MemoryCore:
         entry = self.journal.execute(
             operation="start_session",
             ops=[FileMutationOp(path=target_path, action="write", after_content=rendered)],
-            metadata={"session_id": ses_id},
+            metadata={"session_id": ses_id, "scope_id": scope_id},
             client_id=idem.get("client_id"),
             idempotency_key=idem.get("idempotency_key"),
             request_hash=idem.get("request_hash"),
@@ -707,15 +759,38 @@ class MemoryCore:
         }
 
     def _try_read_policy_document(self, record_id: str, *, max_chars: int) -> dict[str, Any] | None:
-        """Allow reading versioned policy files advertised in bootstrap (R17)."""
-        norm = record_id.replace("\\", "/").lstrip("/")
-        if norm != "START-HERE.md" and not norm.startswith("System/Rules/") and not norm.startswith("System/Templates/"):
+        """Allow reading versioned policy files strictly within START-HERE.md or System/{Rules,Templates}/ (R17, F02)."""
+        if "\\" in record_id or ".." in record_id.split("/") or record_id.startswith("/"):
             return None
+        norm = record_id.strip()
         if not norm.endswith(".md"):
             return None
-        candidate = ensure_within(self.config.vault_dir, self.config.vault_dir / norm)
+
+        vault_root = self.config.vault_dir.resolve()
+        if norm == "START-HERE.md":
+            allowed_root = vault_root
+            raw_candidate = vault_root / "START-HERE.md"
+        elif norm.startswith("System/Rules/"):
+            allowed_root = (vault_root / "System" / "Rules").resolve()
+            raw_candidate = vault_root / norm
+        elif norm.startswith("System/Templates/"):
+            allowed_root = (vault_root / "System" / "Templates").resolve()
+            raw_candidate = vault_root / norm
+        else:
+            return None
+
+        # Reject symlinks and verify canonical containment inside the exact permitted policy subtree
+        if raw_candidate.is_symlink():
+            return None
+        try:
+            candidate = ensure_within(allowed_root, raw_candidate)
+        except MemoryServiceError:
+            return None
+        if norm == "START-HERE.md" and candidate != (vault_root / "START-HERE.md").resolve():
+            return None
         if not candidate.is_file():
             return None
+
         raw = candidate.read_text(encoding="utf-8")
         return {
             "id": norm,
@@ -793,14 +868,22 @@ class MemoryCore:
             warnings.append("Inference origin downgraded status from 'current' to 'uncertain' per memory policy")
 
         sources = payload.get("sources") or []
-        self._validate_sources(sources, caller_scopes=ctx["allowed_scopes"], target_scope=scope_id)
+        mem_type = str(payload.get("type") or "")
+        self._validate_sources(
+            sources,
+            caller_scopes=ctx["allowed_scopes"],
+            target_scope=scope_id,
+            origin=origin,
+            record_type=mem_type,
+            status=status,
+        )
 
         mem_id = new_id("mem")
         now = utc_now_iso()
         meta: dict[str, Any] = {
             "schema_version": "1.0",
             "id": mem_id,
-            "type": str(payload.get("type") or ""),
+            "type": mem_type,
             "scope_id": scope_id,
             "project_id": payload.get("project_id"),
             "title": title,
@@ -828,7 +911,7 @@ class MemoryCore:
         entry = self.journal.execute(
             operation="create_memory",
             ops=[FileMutationOp(path=target_path, action="write", after_content=rendered)],
-            metadata={"record_id": mem_id},
+            metadata={"record_id": mem_id, "scope_id": scope_id},
             client_id=idem.get("client_id"),
             idempotency_key=idem.get("idempotency_key"),
             request_hash=idem.get("request_hash"),
@@ -982,7 +1065,14 @@ class MemoryCore:
 
         priority = str(payload.get("priority") or "normal")
         sources = payload.get("sources") or []
-        self._validate_sources(sources, caller_scopes=ctx["allowed_scopes"], target_scope=scope_id)
+        self._validate_sources(
+            sources,
+            caller_scopes=ctx["allowed_scopes"],
+            target_scope=scope_id,
+            origin=origin,
+            record_type="task",
+            status=status,
+        )
 
         task_id = new_id("task")
         depends_on = list(payload.get("depends_on") or [])
@@ -1032,7 +1122,7 @@ class MemoryCore:
         entry = self.journal.execute(
             operation="create_task",
             ops=[FileMutationOp(path=target_path, action="write", after_content=rendered)],
-            metadata={"record_id": task_id},
+            metadata={"record_id": task_id, "scope_id": scope_id},
             client_id=idem.get("client_id"),
             idempotency_key=idem.get("idempotency_key"),
             request_hash=idem.get("request_hash"),
@@ -1274,7 +1364,7 @@ class MemoryCore:
         entry = self.journal.execute(
             operation="ingest_document",
             ops=[FileMutationOp(path=companion_path, action="write", after_content=rendered)],
-            metadata={"record_id": doc_id},
+            metadata={"record_id": doc_id, "document_id": doc_id, "scope_id": scope_id},
             client_id=idem.get("client_id"),
             idempotency_key=idem.get("idempotency_key"),
             request_hash=idem.get("request_hash"),
@@ -1500,7 +1590,12 @@ class MemoryCore:
         raise MemoryServiceError("not_found_or_unavailable", "Record not found or unavailable")
 
     def _cascade_forget_derived(self, forgotten_source_id: str, *, reason: str) -> list[str]:
-        """Recursively remove derived records whose only evidence was forgotten, or strip the forgotten citation (R13)."""
+        """
+        Conservatively remove all derived records citing any forgotten source — including
+        mixed-source records, their historical revisions, jobs, and downstream derivatives —
+        so forgotten private markers cannot survive in blended bodies or history (R13, F06).
+        Independent surviving source events remain intact for fresh reconstruction.
+        """
         forgotten_ids: list[str] = []
         queue = [forgotten_source_id]
         visited: set[str] = {forgotten_source_id}
@@ -1512,43 +1607,28 @@ class MemoryCore:
                 dep_id = dep["id"]
                 if dep_id in visited:
                     continue
-                meta = dict(dep["metadata"])
-                remaining_sources = [
-                    s for s in (meta.get("sources") or []) if isinstance(s, dict) and s.get("record_id") != src_id
-                ]
                 dep_path = Path(dep["file_path"])
-                if not remaining_sources:
-                    # No independent surviving evidence -> remove derived active copy completely
-                    if dep_path.is_file():
-                        dep_path.unlink()
-                    self.journal.delete_revision_history(dep_id)
-                    self.index.delete_jobs_for_target(dep_id)
-                    self.index.delete_record(dep_id)
-                    self.index.add_tombstone(
-                        record_id=dep_id,
-                        kind=dep["kind"],
-                        scope_id=dep["scope_id"],
-                        fingerprints=[f"id:{dep_id}"],
-                        reason=reason,
+                if dep_path.is_file():
+                    dep_path.unlink()
+                if dep["kind"] == "document":
+                    delete_document_artifacts(
+                        self.config,
+                        doc_id=dep_id,
+                        original_attachment_path=dep["metadata"].get("original_attachment_path"),
                     )
-                    forgotten_ids.append(dep_id)
-                    visited.add(dep_id)
-                    queue.append(dep_id)
-                else:
-                    # Independent evidence survives -> strip the forgotten source citation and refresh
-                    meta["sources"] = remaining_sources
-                    meta["revision"] = int(meta.get("revision", 1)) + 1
-                    meta["updated_at"] = utc_now_iso()
-                    rendered = render_markdown(meta, dep["body"])
-                    atomic_write_text(dep_path, rendered)
-                    self.index.upsert_record(
-                        record_id=dep_id,
-                        kind=dep["kind"],
-                        meta=meta,
-                        body=dep["body"],
-                        file_path=dep_path,
-                        raw_hash=content_hash(rendered),
-                    )
+                self.journal.delete_revision_history(dep_id)
+                self.index.delete_jobs_for_target(dep_id)
+                self.index.delete_record(dep_id)
+                self.index.add_tombstone(
+                    record_id=dep_id,
+                    kind=dep["kind"],
+                    scope_id=dep["scope_id"],
+                    fingerprints=[f"id:{dep_id}"],
+                    reason=reason,
+                )
+                forgotten_ids.append(dep_id)
+                visited.add(dep_id)
+                queue.append(dep_id)
         return forgotten_ids
 
     # -- Dynamic Areas & Projections ------------------------------------------
@@ -1765,15 +1845,27 @@ class MemoryCore:
             return rec["scope_id"]
         return None
 
-    def _validate_sources(self, sources: Any, *, caller_scopes: list[str], target_scope: str) -> None:
+    def _validate_sources(
+        self,
+        sources: Any,
+        *,
+        caller_scopes: list[str],
+        target_scope: str,
+        origin: str | None = None,
+        record_type: str | None = None,
+        status: str | None = None,
+    ) -> None:
         """
         Validate every cited source exists, is not forgotten, is readable by the caller,
-        does not broaden disclosure across scopes (R05, R06), and matches any cited quote.
+        does not broaden disclosure across scopes (R05, R06), matches any cited quote,
+        and satisfies speaker/origin attribution rules (F07).
         """
         if not isinstance(sources, list) or not sources:
             raise MemoryServiceError("validation_failed", "At least one source reference is required")
 
         norm_target = normalize_scope_id(target_scope)
+        has_user_attributed_source = False
+
         for s in sources:
             if not isinstance(s, dict) or not s.get("record_id"):
                 raise MemoryServiceError("validation_failed", "Each source must be an object with 'record_id'")
@@ -1786,6 +1878,8 @@ class MemoryCore:
             evt = self.index.get_event(sid)
             if evt is not None:
                 src_scope = evt["scope_id"]
+                if evt.get("speaker") == "user":
+                    has_user_attributed_source = True
                 evt_path = Path(evt["file_path"])
                 if evt_path.is_file():
                     src_text = str(json.loads(evt_path.read_text(encoding="utf-8")).get("content") or "")
@@ -1793,6 +1887,8 @@ class MemoryCore:
                 rec = self.index.get_record(sid)
                 if rec is not None:
                     src_scope = rec["scope_id"]
+                    if rec.get("origin") == "explicit_user_statement":
+                        has_user_attributed_source = True
                     src_text = str(rec.get("body") or "")
 
             if src_scope is None:
@@ -1818,6 +1914,18 @@ class MemoryCore:
                         "validation_failed",
                         f"Cited quote was not found in source '{sid}'",
                     )
+
+        # Speaker attribution & user-acceptance enforcement (F07)
+        if origin == "explicit_user_statement" and not has_user_attributed_source:
+            raise MemoryServiceError(
+                "validation_failed",
+                "origin 'explicit_user_statement' requires at least one user-authored source event or explicit user record",
+            )
+        if record_type == "decision" and status == "current" and not has_user_attributed_source:
+            raise MemoryServiceError(
+                "validation_failed",
+                "An accepted 'current' decision requires evidence of user acceptance (cannot rely solely on assistant/tool proposals)",
+            )
 
     _HANDLERS = {
         "start_session": start_session,

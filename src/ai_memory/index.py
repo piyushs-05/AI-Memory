@@ -86,6 +86,7 @@ CREATE TABLE IF NOT EXISTS idempotency_receipts (
     idempotency_key TEXT NOT NULL,
     operation TEXT NOT NULL,
     request_hash TEXT NOT NULL,
+    scope_id TEXT,
     response_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
     PRIMARY KEY (client_id, idempotency_key)
@@ -142,6 +143,10 @@ class MemoryIndex:
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.executescript(SCHEMA_SQL)
+            # Lightweight migration for existing DBs missing scope_id on idempotency_receipts (F08)
+            cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(idempotency_receipts)").fetchall()}
+            if "scope_id" not in cols:
+                self._conn.execute("ALTER TABLE idempotency_receipts ADD COLUMN scope_id TEXT")
             self._conn.commit()
 
     def close(self) -> None:
@@ -316,13 +321,14 @@ class MemoryIndex:
         where_clauses: list[str] = []
         params: list[Any] = []
 
-        # Scope predicate in SQL
+        # Scope predicate in SQL with escaped LIKE wildcards (R16, F03)
         norm_scopes = [s.strip().lower() for s in permitted_scopes if s.strip()]
         if "*" not in norm_scopes:
             scope_parts: list[str] = []
             for s in norm_scopes:
-                scope_parts.append("(lower(r.scope_id) = ? OR lower(r.scope_id) LIKE ?)")
-                params.extend([s, f"{s}/%"])
+                escaped = s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                scope_parts.append("(lower(r.scope_id) = ? OR lower(r.scope_id) LIKE ? ESCAPE '\\')")
+                params.extend([s, f"{escaped}/%"])
             where_clauses.append("(" + " OR ".join(scope_parts) + ")")
 
         if kind:
@@ -422,6 +428,12 @@ class MemoryIndex:
             record_id = meta.get("id")
             if not isinstance(record_id, str) or not meta.get("scope_id"):
                 continue
+            # Never resurrect a forgotten/tombstoned record during reconciliation (F05)
+            if self.is_tombstoned(record_id=record_id):
+                if record_id in existing_map:
+                    self.delete_record(record_id)
+                    removed += 1
+                continue
             kind = _infer_kind(record_id, str(meta.get("type", "")))
             if kind is None:
                 continue
@@ -449,7 +461,10 @@ class MemoryIndex:
         return {"added": added, "updated": updated, "removed": removed}
 
     def reconcile_record_file(self, record_id: str) -> dict[str, Any] | None:
-        """Check if a single record's file changed on disk and refresh its index entry before read (R12)."""
+        """Check if a single record's file changed on disk and refresh its index entry before read (R12, F05)."""
+        if self.is_tombstoned(record_id=record_id):
+            self.delete_record(record_id)
+            return None
         rec = self.get_record(record_id)
         if rec is None:
             return None
@@ -487,6 +502,8 @@ class MemoryIndex:
             return False
         record_id = meta.get("id")
         if not isinstance(record_id, str) or not meta.get("scope_id"):
+            return False
+        if self.is_tombstoned(record_id=record_id):
             return False
         kind = _infer_kind(record_id, str(meta.get("type", "")))
         if kind is None:
@@ -566,16 +583,31 @@ class MemoryIndex:
             return dict(row) if row else None
 
     def save_idempotency(
-        self, *, client_id: str, key: str, operation: str, request_hash: str, response: dict[str, Any]
+        self,
+        *,
+        client_id: str,
+        key: str,
+        operation: str,
+        request_hash: str,
+        response: dict[str, Any],
+        scope_id: str | None = None,
     ) -> None:
         with self._lock:
             self._conn.execute(
                 """
                 INSERT OR REPLACE INTO idempotency_receipts(
-                    client_id, idempotency_key, operation, request_hash, response_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    client_id, idempotency_key, operation, request_hash, scope_id, response_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (client_id, key, operation, request_hash, json.dumps(response, ensure_ascii=False), utc_now_iso()),
+                (
+                    client_id,
+                    key,
+                    operation,
+                    request_hash,
+                    scope_id,
+                    json.dumps(response, ensure_ascii=False),
+                    utc_now_iso(),
+                ),
             )
             self._conn.commit()
 

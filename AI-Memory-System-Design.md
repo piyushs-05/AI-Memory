@@ -568,13 +568,13 @@ Host-specific setup details (addresses, SSH aliases/key paths, host fingerprints
 | --- | --- | --- |
 | Canonical Markdown + YAML frontmatter + Draft 2020-12 JSON schemas | Implemented & verified | `schemas/*.schema.json`, `frontmatter.py`, `schemas.py` |
 | Dynamic areas (`config/areas.json`), nested scopes, custom folders | Implemented & verified | Unique case-insensitive folder ownership enforced; new folders do not grant new scope permissions |
-| Bearer auth, `credential ∩ context` re-check on every call, whole-response metadata filtering | Implemented & verified | `access.py`, `core.py`, `views.py` |
-| Source existence, scope inheritance, and quote verification | Implemented & verified | `_validate_sources` in `core.py` |
-| Cross-process write lock, durable idempotency correlation, pre-apply edit check, revision history | Implemented & verified | `journal.py`, `records/revisions/<id>/rev_*.json` |
-| Cascading `forget_record` (derived memories, revision history, document originals, extraction caches, jobs, tombstones) | Implemented & verified | `core.py`, `documents.py` |
-| Startup reconciliation, on-read manual edit sync, periodic worker reconciliation | Implemented & verified | `index.py`, `worker.py`; unmanaged ordinary Markdown adoption remains explicit |
-| Policy & raw event reads via `read_page` | Implemented & verified | Allowlisted `START-HERE.md`, `System/Rules/*.md`, `System/Templates/*.md`, and scoped `evt_*` |
-| Background worker + bounded PDF/text/OCR extraction (`pdftotext`/`pdfinfo`/`tesseract`) | Implemented & verified | Started automatically by `ai-memory serve` and callable via `ai-memory run-worker` |
+| Bearer auth, `credential ∩ context` re-check on every call, whole-response metadata filtering, cached-response scope enforcement | Implemented & verified | `access.py`, `core.py`, `views.py`; SQL scope matching escapes `LIKE` wildcards (`_`, `%`) |
+| Source existence, scope inheritance, quote verification, and speaker/decision attribution | Implemented & verified | `_validate_sources` in `core.py`; assistant-only events cannot establish `explicit_user_statement` or accepted `current` decisions |
+| Reentrant cross-process OS write lock (`flock`), crash-before-response journal reconstruction, pre-apply edit check, revision history | Implemented & verified (Linux + Windows) | `journal.py`, `records/revisions/<id>/rev_*.json`; outer-only OS lock avoids nested Linux deadlock while blocking competing processes |
+| Cascading `forget_record` (single- and multi-source derived records, revision history, document originals, extraction caches, jobs, tombstone enforcement on reconcile/restore) | Implemented & verified | `core.py`, `index.py`, `documents.py`; restored tombstoned files are never reindexed as active memory |
+| Startup reconciliation, on-read manual edit sync, periodic worker reconciliation | Implemented & verified (structured records) | `index.py`, `worker.py`; automatic adoption of unmanaged ordinary Markdown/manual PDFs remains planned |
+| Policy & raw event reads via `read_page` | Implemented & verified | Strict canonical containment within `START-HERE.md` and `System/{Rules,Templates}/`, plus scoped `evt_*` |
+| Background worker + bounded PDF/text/OCR extraction (`pdftotext`/`pdfinfo`/`tesseract`) | Implemented (text extraction verified; live PDF/OCR untested in CI) | Started automatically by `ai-memory serve` and callable via `ai-memory run-worker` |
 | Gemini consolidation adapter (`GeminiConsolidationProvider`) | Partial (implemented, unconfigured) | Offline `StubConsolidationProvider` is active by default; Gemini requires verified credentials, quota, and scope external-processing approval |
 | Automated off-host backup & systemd reboot autostart | Planned | Not yet configured on deployment host |
 

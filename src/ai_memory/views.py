@@ -51,10 +51,25 @@ def build_bootstrap_packet(
 
     return {
         "introduction": (
-            "Portable AI Memory Service. Follow System/Rules/*: cite sources on all writes, "
-            "pass idempotency_key on mutations, respect scope boundaries, and do not promote "
-            "temporary states or inferences to lasting facts."
+            "Portable AI Memory Service. Follow the mandatory_workflow and inline_rules below "
+            "before creating or updating records; full versioned references are readable via read_page."
         ),
+        "mandatory_workflow": [
+            "1. Before writing any memory or task, call start_session and append_events with the FULL accessible user message verbatim (use speaker='user', never drop clauses).",
+            "2. Persist EVERY distinct item from the user message citing the captured evt_* ID in sources=[{'record_id': 'evt_...', 'quote': '...'}]:",
+            "   - Temporary experiment or short-term activity -> create_memory(type='state', origin='explicit_user_statement'); never promote to a lasting preference.",
+            "   - Actionable task or reminder -> create_task(origin='explicit_user_statement', status='next').",
+            "   - Assistant suggestion -> proposal only (create_task with origin='assistant_proposal', proposal=true, status='inbox'); never mark as an accepted current decision.",
+            "3. Always call end_session(session_id=...) before finishing a capture/write turn so consolidation runs.",
+        ],
+        "inline_rules": {
+            "event_speakers": ["user", "assistant", "system", "tool", "external"],
+            "memory_types": ["fact", "preference", "decision", "state", "lesson", "summary"],
+            "memory_origins": ["explicit_user_statement", "observation", "inference", "import"],
+            "task_origins": ["explicit_user_statement", "observation", "inference", "import", "assistant_proposal"],
+            "idempotency_key_required": True,
+            "sources_format": [{"record_id": "evt_...", "quote": "optional verbatim substring"}],
+        },
         "timezone": config.timezone,
         "local_date": today,
         "allowed_scopes": allowed_scopes,

@@ -806,3 +806,33 @@ def test_f08_cached_response_obeys_narrower_valid_context(setup):
     # Must NOT have re-executed or created a second record
     assert len(core.index.list_records(kind="memory")) == 1
 
+
+def test_ph2_mcp_tool_schemas_and_inline_bootstrap_rules(setup):
+    """PH2-01/02/03: MCP tools/list exposes nested schemas/enums and open_context includes mandatory_workflow inline."""
+    from ai_memory.mcp_server import handle_jsonrpc
+
+    core, owner, work, ctx = setup
+
+    tools_resp = handle_jsonrpc(core, owner, {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
+    tools = {t["name"]: t["inputSchema"] for t in tools_resp["result"]["tools"]}
+
+    # append_events advertises speaker enum and required fields
+    evt_item = tools["append_events"]["properties"]["events"]["items"]
+    assert set(evt_item["required"]) >= {"speaker", "content"}
+    assert "user" in evt_item["properties"]["speaker"]["enum"]
+
+    # create_memory & create_task advertise nested sources.record_id and origin enums
+    for name in ("create_memory", "create_task"):
+        src_item = tools[name]["properties"]["sources"]["items"]
+        assert "record_id" in src_item["required"]
+        assert "explicit_user_statement" in tools[name]["properties"]["origin"]["enum"]
+
+    # open_context returns inline mandatory_workflow and inline_rules
+    open_resp = core.dispatch(client=owner, operation="open_context", payload={"purpose": "onboarding check"})
+    assert open_resp["ok"]
+    bootstrap = open_resp["data"]["bootstrap"]
+    assert len(bootstrap["mandatory_workflow"]) >= 3
+    assert any("end_session" in line for line in bootstrap["mandatory_workflow"])
+    assert "explicit_user_statement" in bootstrap["inline_rules"]["task_origins"]
+
+

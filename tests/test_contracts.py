@@ -532,8 +532,8 @@ def test_f01_linux_mutation_and_cross_process_lock_no_deadlock(tmp_path):
     try:
         with core.journal.mutation_boundary():
             lock_probe = (
-                "import fcntl; "
-                f"f = open({str(core.journal._lock_file_path)!r}, 'a+b'); "
+                "import fcntl\n"
+                f"f = open({str(core.journal._lock_file_path)!r}, 'a+b')\n"
                 "try:\n"
                 "    fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
                 "    print('ACQUIRED')\n"
